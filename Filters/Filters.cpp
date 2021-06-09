@@ -7,6 +7,12 @@
 #include <dvdmedia.h>
 #include "filters.h"
 
+#include <string>
+
+#define SHARED_MEMORY_NAME "LiveDriverCameraNBind_Shared_Memory"
+#define VIRTUALCAMERA_WIDTH 1280
+#define VIRTUALCAMERA_HEIGHT 720
+
 //////////////////////////////////////////////////////////////////////////
 //  CVCam is the source filter which masquerades as a capture device
 //////////////////////////////////////////////////////////////////////////
@@ -40,11 +46,27 @@ HRESULT CVCam::QueryInterface(REFIID riid, void **ppv)
 // CVCamStream is the one and only output pin of CVCam which handles 
 // all the stuff.
 //////////////////////////////////////////////////////////////////////////
-CVCamStream::CVCamStream(HRESULT *phr, CVCam *pParent, LPCWSTR pPinName) :
-    CSourceStream(NAME("Virtual Cam"),phr, pParent, pPinName), m_pParent(pParent)
+CVCamStream::CVCamStream(HRESULT *phr, CVCam *pParent, LPCWSTR pPinName)
+	: CSourceStream(NAME("Virtual Cam"), phr, pParent, pPinName)
+	, m_pParent(pParent)
+	, m_OpenSharedMemoryForRead(NULL)
+	, m_SharedMemorySize(0)
+	, m_SharedMemory(NULL)
 {
-    // Set the default media type as 320x240x24@15
-    GetMediaType(4, &m_mt);
+	GetMediaType(1, &m_mt);
+
+	char achTemp[MAX_PATH];
+	GetModuleFileNameA(g_hInst, achTemp, sizeof(achTemp));
+	std::string dllName(achTemp);
+	size_t pos = min(dllName.find_last_of("\\"), dllName.find_last_of("/"));
+	dllName = dllName.substr(0, pos);
+	m_LiveDriverCamera = ::LoadLibraryA((dllName + "\\LiveDriverSDKCameraWrapper.dll").c_str());
+	if (m_LiveDriverCamera == NULL)
+	{
+		MessageBoxA(NULL, "Missing LiveDriverSDKCameraWrapper.dll", "Error", MB_OK);
+		exit(1);
+	}
+	m_OpenSharedMemoryForRead = (OpenSharedMemoryForReadFunc)GetProcAddress(m_LiveDriverCamera, "OpenSharedMemoryForRead");
 }
 
 CVCamStream::~CVCamStream()
@@ -86,8 +108,39 @@ HRESULT CVCamStream::FillBuffer(IMediaSample *pms)
     long lDataLen;
     pms->GetPointer(&pData);
     lDataLen = pms->GetSize();
-    for(int i = 0; i < lDataLen; ++i)
-        pData[i] = rand();
+
+	if (m_SharedMemory == NULL || lDataLen > m_SharedMemorySize)
+	{
+		try
+		{
+			m_SharedMemory = (char*)m_OpenSharedMemoryForRead(SHARED_MEMORY_NAME, m_SharedMemorySize);
+		}
+		catch (...)
+		{
+		}
+		for (int i = 0; i < lDataLen; ++i)
+			pData[i] = rand();
+	}
+	else
+	{
+		// BGRA => BGR and flip vertically
+		static size_t srcStride = VIRTUALCAMERA_WIDTH * 4;
+		static size_t dstStride = VIRTUALCAMERA_WIDTH * 3;
+		char* src = (char*)m_SharedMemory;
+		char* dst = (char*)(pData + dstStride * (VIRTUALCAMERA_HEIGHT - 1));
+		for (int row = 0; row < VIRTUALCAMERA_HEIGHT; ++row)
+		{
+			for (int col = 0; col < VIRTUALCAMERA_WIDTH; ++col)
+			{
+				dst[0] = src[0];
+				dst[1] = src[1];
+				dst[2] = src[2];
+				src += 4;
+				dst += 3;
+			}
+			dst -= 2 * dstStride;
+		}
+	}
 
     return NOERROR;
 } // FillBuffer
@@ -129,8 +182,8 @@ HRESULT CVCamStream::GetMediaType(int iPosition, CMediaType *pmt)
     pvi->bmiHeader.biCompression = BI_RGB;
     pvi->bmiHeader.biBitCount    = 24;
     pvi->bmiHeader.biSize       = sizeof(BITMAPINFOHEADER);
-    pvi->bmiHeader.biWidth      = 80 * iPosition;
-    pvi->bmiHeader.biHeight     = 60 * iPosition;
+    pvi->bmiHeader.biWidth      = VIRTUALCAMERA_WIDTH;
+    pvi->bmiHeader.biHeight     = VIRTUALCAMERA_HEIGHT;
     pvi->bmiHeader.biPlanes     = 1;
     pvi->bmiHeader.biSizeImage  = GetBitmapSize(&pvi->bmiHeader);
     pvi->bmiHeader.biClrImportant = 0;
@@ -215,7 +268,7 @@ HRESULT STDMETHODCALLTYPE CVCamStream::GetFormat(AM_MEDIA_TYPE **ppmt)
 
 HRESULT STDMETHODCALLTYPE CVCamStream::GetNumberOfCapabilities(int *piCount, int *piSize)
 {
-    *piCount = 8;
+    *piCount = 1;
     *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS);
     return S_OK;
 }
@@ -225,13 +278,11 @@ HRESULT STDMETHODCALLTYPE CVCamStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE *
     *pmt = CreateMediaType(&m_mt);
     DECLARE_PTR(VIDEOINFOHEADER, pvi, (*pmt)->pbFormat);
 
-    if (iIndex == 0) iIndex = 4;
-
     pvi->bmiHeader.biCompression = BI_RGB;
     pvi->bmiHeader.biBitCount    = 24;
     pvi->bmiHeader.biSize       = sizeof(BITMAPINFOHEADER);
-    pvi->bmiHeader.biWidth      = 80 * iIndex;
-    pvi->bmiHeader.biHeight     = 60 * iIndex;
+    pvi->bmiHeader.biWidth      = VIRTUALCAMERA_WIDTH;
+    pvi->bmiHeader.biHeight     = VIRTUALCAMERA_HEIGHT;
     pvi->bmiHeader.biPlanes     = 1;
     pvi->bmiHeader.biSizeImage  = GetBitmapSize(&pvi->bmiHeader);
     pvi->bmiHeader.biClrImportant = 0;
@@ -251,21 +302,21 @@ HRESULT STDMETHODCALLTYPE CVCamStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE *
     
     pvscc->guid = FORMAT_VideoInfo;
     pvscc->VideoStandard = AnalogVideo_None;
-    pvscc->InputSize.cx = 640;
-    pvscc->InputSize.cy = 480;
-    pvscc->MinCroppingSize.cx = 80;
-    pvscc->MinCroppingSize.cy = 60;
-    pvscc->MaxCroppingSize.cx = 640;
-    pvscc->MaxCroppingSize.cy = 480;
-    pvscc->CropGranularityX = 80;
-    pvscc->CropGranularityY = 60;
+    pvscc->InputSize.cx = VIRTUALCAMERA_WIDTH;
+    pvscc->InputSize.cy = VIRTUALCAMERA_HEIGHT;
+    pvscc->MinCroppingSize.cx = VIRTUALCAMERA_WIDTH;
+    pvscc->MinCroppingSize.cy = VIRTUALCAMERA_HEIGHT;
+    pvscc->MaxCroppingSize.cx = VIRTUALCAMERA_WIDTH;
+    pvscc->MaxCroppingSize.cy = VIRTUALCAMERA_HEIGHT;
+    pvscc->CropGranularityX = 0;
+    pvscc->CropGranularityY = 0;
     pvscc->CropAlignX = 0;
     pvscc->CropAlignY = 0;
 
-    pvscc->MinOutputSize.cx = 80;
-    pvscc->MinOutputSize.cy = 60;
-    pvscc->MaxOutputSize.cx = 640;
-    pvscc->MaxOutputSize.cy = 480;
+    pvscc->MinOutputSize.cx = VIRTUALCAMERA_WIDTH;
+    pvscc->MinOutputSize.cy = VIRTUALCAMERA_HEIGHT;
+    pvscc->MaxOutputSize.cx = VIRTUALCAMERA_WIDTH;
+    pvscc->MaxOutputSize.cy = VIRTUALCAMERA_HEIGHT;
     pvscc->OutputGranularityX = 0;
     pvscc->OutputGranularityY = 0;
     pvscc->StretchTapsX = 0;
@@ -274,8 +325,8 @@ HRESULT STDMETHODCALLTYPE CVCamStream::GetStreamCaps(int iIndex, AM_MEDIA_TYPE *
     pvscc->ShrinkTapsY = 0;
     pvscc->MinFrameInterval = 200000;   //50 fps
     pvscc->MaxFrameInterval = 50000000; // 0.2 fps
-    pvscc->MinBitsPerSecond = (80 * 60 * 3 * 8) / 5;
-    pvscc->MaxBitsPerSecond = 640 * 480 * 3 * 8 * 50;
+    pvscc->MinBitsPerSecond = (VIRTUALCAMERA_WIDTH * VIRTUALCAMERA_HEIGHT * 3 * 8) / 5;
+    pvscc->MaxBitsPerSecond = VIRTUALCAMERA_WIDTH * VIRTUALCAMERA_HEIGHT * 3 * 8 * 50;
 
     return S_OK;
 }

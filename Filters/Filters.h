@@ -4,6 +4,8 @@
 
 EXTERN_C const GUID CLSID_VirtualCam;
 
+typedef void* (*OpenSharedMemoryForReadFunc)(const char* name, long long& size);
+
 class CVCamStream;
 class CVCam : public CSource
 {
@@ -70,7 +72,10 @@ private:
     HBITMAP m_hLogoBmp;
     CCritSec m_cSharedState;
     IReferenceClock *m_pClock;
-
+	HMODULE m_LiveDriverCamera;
+	OpenSharedMemoryForReadFunc m_OpenSharedMemoryForRead;
+	long long m_SharedMemorySize;
+	char *m_SharedMemory;
 };
 
 
